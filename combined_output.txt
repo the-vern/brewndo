@@ -1,825 +1,137 @@
-===== FILE: data_dashboard_v1_26_selenium.py =====
+===== FILE: api_request_splitter.py =====
 """
-DataStudio — Selenium UI Test Suite
-=====================================
-Covers all major user-facing interactions in the DataStudio Dash app.
-
-Setup
------
-    pip install selenium pytest pytest-html webdriver-manager pandas
-
-Usage
------
-    # Start the app in a separate terminal first:
-    python data_dashboard_v1_26.py
-
-    # Then run tests (headless, default):
-    pytest test_datastudio_ui.py -v
-
-    # Run with a visible browser:
-    pytest test_datastudio_ui.py -v --headed
-
-    # Run a specific test:
-    pytest test_datastudio_ui.py::TestUpload::test_upload_csv -v
-
-    # Generate an HTML report:
-    pytest test_datastudio_ui.py -v --html=report.html --self-contained-html
-
-Configuration
--------------
-Set these env vars to override defaults:
-    DS_BASE_URL   — app URL          (default: http://localhost:8050)
-    DS_HEADED     — "1" for headed   (default: headless)
-    DS_TIMEOUT    — wait timeout (s) (default: 15)
+API Request Splitter
+--------------------
+Handles APIs with a 500,000 record limit by:
+1. Checking the record count for a payload via the count endpoint
+2. Splitting timestamps into smaller batches if the limit is exceeded
+3. Recursively validating each batch before submitting
 """
 
-import base64
-import io
-import os
-import subprocess
-import sys
-import tempfile
-import time
+import math
+import logging
+from typing import Any
+import requests
 
-import pandas as pd
-import pytest
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+logger = logging.getLogger(__name__)
 
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    _USE_WDM = True
-except ImportError:
-    _USE_WDM = False
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-BASE_URL = os.environ.get("DS_BASE_URL", "http://localhost:8050")
-HEADED   = os.environ.get("DS_HEADED", "0") == "1"
-TIMEOUT  = int(os.environ.get("DS_TIMEOUT", "15"))
-
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-def _make_csv(rows: int = 10) -> str:
-    """Return path to a temporary CSV file."""
-    df = pd.DataFrame({
-        "name":   [f"Item {i}" for i in range(rows)],
-        "value":  list(range(rows)),
-        "score":  [round(i * 1.5, 2) for i in range(rows)],
-        "flag":   [i % 2 == 0 for i in range(rows)],
-        "nullable": [None if i % 3 == 0 else f"v{i}" for i in range(rows)],
-    })
-    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w")
-    df.to_csv(tmp.name, index=False)
-    tmp.close()
-    return tmp.name
+MAX_RECORDS = 500_000
 
 
-@pytest.fixture(scope="session")
-def sample_csv():
-    path = _make_csv()
-    yield path
-    os.unlink(path)
+def check_record_count(count_url: str, payload: dict, session: requests.Session) -> int:
+    """Call the count endpoint and return the number of records for this payload."""
+    response = session.post(count_url, json=payload)
+    response.raise_for_status()
+    return response.json()["count"]
 
 
-@pytest.fixture(scope="session")
-def sample_xlsx():
-    df = pd.DataFrame({"col_a": [1, 2, 3], "col_b": ["x", "y", "z"]})
-    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-    tmp.close()
-    df.to_excel(tmp.name, index=False)
-    yield tmp.name
-    os.unlink(tmp.name)
+def submit_request(data_url: str, payload: dict, session: requests.Session) -> Any:
+    """Submit a single API request and return the response data."""
+    response = session.post(data_url, json=payload)
+    response.raise_for_status()
+    return response.json()
 
 
-@pytest.fixture(scope="session")
-def sample_tsv():
-    df = pd.DataFrame({"alpha": [10, 20], "beta": [30, 40]})
-    tmp = tempfile.NamedTemporaryFile(suffix=".tsv", delete=False, mode="w")
-    df.to_csv(tmp.name, sep="\t", index=False)
-    tmp.close()
-    yield tmp.name
-    os.unlink(tmp.name)
+def split_timestamps(timestamps: list, num_chunks: int) -> list[list]:
+    """Split a list of timestamps into `num_chunks` roughly equal parts."""
+    chunk_size = math.ceil(len(timestamps) / num_chunks)
+    return [timestamps[i : i + chunk_size] for i in range(0, len(timestamps), chunk_size)]
 
 
-@pytest.fixture(scope="session")
-def sample_json():
-    df = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
-    tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
-    df.to_json(tmp.name, orient="records", indent=2)
-    tmp.close()
-    yield tmp.name
-    os.unlink(tmp.name)
+def fetch_all_records(
+    count_url: str,
+    data_url: str,
+    payload: dict,
+    timestamp_key: str = "timestamps",
+    session: requests.Session = None,
+) -> list[Any]:
+    """
+    Fetch all records for a payload, splitting by timestamps if the record
+    count exceeds MAX_RECORDS (500,000).
 
+    Args:
+        count_url:      URL of the count endpoint  (e.g. "https://api.example.com/count")
+        data_url:       URL of the data endpoint   (e.g. "https://api.example.com/data")
+        payload:        Full request payload dict. Must contain a list of timestamps
+                        under `timestamp_key`.
+        timestamp_key:  The key in `payload` whose value is the list of timestamps.
+                        Defaults to "timestamps".
+        session:        Optional requests.Session (one is created if not provided).
 
-@pytest.fixture(scope="session")
-def driver():
-    opts = ChromeOptions()
-    if not HEADED:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1400,900")
-    opts.add_argument("--disable-gpu")
+    Returns:
+        A flat list of all results across every batch request.
+    """
+    if session is None:
+        session = requests.Session()
 
-    if _USE_WDM:
-        svc = ChromeService(ChromeDriverManager().install())
-        drv = webdriver.Chrome(service=svc, options=opts)
-    else:
-        drv = webdriver.Chrome(options=opts)
+    timestamps = payload.get(timestamp_key)
+    if not timestamps:
+        raise ValueError(f"Payload must contain a non-empty list at key '{timestamp_key}'.")
 
-    drv.implicitly_wait(2)
-    yield drv
-    drv.quit()
+    results = []
+    # Use a stack to avoid deep recursion for very large timestamp lists.
+    # Each item is a list of timestamps to process.
+    pending_batches: list[list] = [timestamps]
 
+    while pending_batches:
+        current_timestamps = pending_batches.pop()
+        batch_payload = {**payload, timestamp_key: current_timestamps}
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+        logger.info("Checking record count for batch of %d timestamp(s)…", len(current_timestamps))
+        count = check_record_count(count_url, batch_payload, session)
+        logger.info("  → %d records", count)
 
-class Page:
-    """Thin helper that wraps WebDriver + WebDriverWait."""
+        if count <= MAX_RECORDS:
+            # Safe to submit
+            logger.info("  Submitting batch (%d timestamps, %d records).", len(current_timestamps), count)
+            result = submit_request(data_url, batch_payload, session)
+            results.append(result)
+        else:
+            # Need to split further; aim for two halves, but use math to be safe
+            num_chunks = math.ceil(count / MAX_RECORDS)
+            # We can't split further than one timestamp per chunk
+            num_chunks = min(num_chunks, len(current_timestamps))
 
-    def __init__(self, driver: webdriver.Chrome, timeout: int = TIMEOUT):
-        self.d = driver
-        self.w = WebDriverWait(driver, timeout)
+            if num_chunks <= 1:
+                raise RuntimeError(
+                    f"A single timestamp returns {count} records, which exceeds the "
+                    f"{MAX_RECORDS:,} limit. Cannot split further."
+                )
 
-    # -- Navigation -----------------------------------------------------------
-
-    def load(self, url: str = BASE_URL) -> None:
-        self.d.get(url)
-        self.wait_for_app()
-
-    def wait_for_app(self) -> None:
-        """Wait until the DataStudio app root is visible."""
-        self.w.until(EC.presence_of_element_located((By.ID, "app-root")))
-        # Also wait for React to finish hydrating (Dash quirk)
-        time.sleep(0.5)
-
-    # -- Elements -------------------------------------------------------------
-
-    def find(self, by: By, value: str):
-        return self.w.until(EC.presence_of_element_located((by, value)))
-
-    def find_clickable(self, by: By, value: str):
-        return self.w.until(EC.element_to_be_clickable((by, value)))
-
-    def find_id(self, eid: str):
-        return self.find(By.ID, eid)
-
-    def click_id(self, eid: str) -> None:
-        self.find_clickable(By.ID, eid).click()
-
-    # -- Upload ---------------------------------------------------------------
-
-    def upload_file(self, filepath: str) -> None:
-        """
-        Send the file path to the hidden <input type=file> inside dcc.Upload.
-        Dash renders the real input inside the #upload-data container.
-        """
-        inp = self.w.until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "#upload-data input[type='file']")
+            logger.info(
+                "  Count %d exceeds limit. Splitting %d timestamps into %d chunks.",
+                count,
+                len(current_timestamps),
+                num_chunks,
             )
-        )
-        inp.send_keys(filepath)
-        # Wait for the upload-status to update
-        self.w.until(
-            lambda d: d.find_element(By.ID, "upload-status").text.strip() != ""
-            or d.find_element(By.ID, "grid-container").get_attribute("style") != "display: none;"
-        )
-
-    # -- Tools ----------------------------------------------------------------
-
-    def open_tool(self, tool_id: str) -> None:
-        """Click a sidebar nav tool button and wait for the panel to appear."""
-        self.find_clickable(By.ID, tool_id).click()
-        self.w.until(
-            EC.presence_of_element_located((By.ID, "tool-panel-content"))
-        )
-
-    # -- Status / alerts ------------------------------------------------------
-
-    def get_status_text(self) -> str:
-        el = self.find_id("upload-status")
-        return el.text.strip()
-
-    def alert_visible(self, color_keyword: str = "") -> bool:
-        """Check that a Mantine Alert is visible, optionally matching text."""
-        try:
-            alerts = self.d.find_elements(By.CSS_SELECTOR, "[data-mantine-alert]")
-            if not alerts:
-                # Fallback: look for any role=alert
-                alerts = self.d.find_elements(By.CSS_SELECTOR, "[role='alert']")
-            if color_keyword:
-                return any(color_keyword.lower() in a.text.lower() for a in alerts)
-            return len(alerts) > 0
-        except Exception:
-            return False
-
-    def grid_visible(self) -> bool:
-        try:
-            gc = self.d.find_element(By.ID, "grid-container")
-            style = gc.get_attribute("style") or ""
-            return "none" not in style
-        except Exception:
-            return False
-
-    def modal_open(self, modal_id: str) -> bool:
-        try:
-            modal = self.d.find_element(By.ID, modal_id)
-            return modal.get_attribute("data-opened") == "true" or \
-                   "mantine-Modal-content" in (modal.get_attribute("class") or "") or \
-                   modal.is_displayed()
-        except Exception:
-            return False
-
-
-# ── Session-scoped page fixture ───────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def page(driver):
-    p = Page(driver)
-    p.load()
-    return p
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST CLASSES
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestPageLoad:
-    """Basic smoke tests — app loads and key elements are present."""
-
-    def test_title(self, driver, page):
-        page.load()
-        assert "DataStudio" in driver.title
-
-    def test_sidebar_present(self, page):
-        assert page.find_id("sidebar") is not None
-
-    def test_upload_zone_present(self, page):
-        assert page.find_id("upload-data") is not None
-
-    def test_nav_categories_visible(self, page):
-        for cat_id in ("cat-explore", "cat-transform", "cat-export"):
-            el = page.d.find_element(By.ID, cat_id)
-            assert el is not None, f"Category accordion item not found: {cat_id}"
-
-    def test_sidebar_logo_text(self, page):
-        logo = page.find_id("sidebar-logo-text")
-        assert "DataStudio" in logo.text
-
-    def test_undo_button_disabled_initially(self, page):
-        btn = page.find_id("btn-undo")
-        # Disabled attribute should be present (Mantine sets data-disabled)
-        disabled = btn.get_attribute("disabled") or btn.get_attribute("data-disabled")
-        assert disabled is not None or btn.get_attribute("aria-disabled") == "true"
-
-
-class TestUpload:
-    """File upload flows: valid files, unsupported types, and size info."""
-
-    def test_upload_csv(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        assert page.grid_visible(), "AG Grid should appear after a valid CSV upload"
-
-    def test_upload_shows_row_count(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        status = page.get_status_text()
-        # Status message should mention rows or columns
-        assert any(k in status.lower() for k in ("row", "column", "loaded", "item")), \
-            f"Unexpected status text: {status!r}"
-
-    def test_upload_xlsx(self, page, sample_xlsx):
-        page.load()
-        page.upload_file(sample_xlsx)
-        assert page.grid_visible(), "Grid should appear after XLSX upload"
-
-    def test_upload_tsv(self, page, sample_tsv):
-        page.load()
-        page.upload_file(sample_tsv)
-        assert page.grid_visible(), "Grid should appear after TSV upload"
-
-    def test_upload_json(self, page, sample_json):
-        page.load()
-        page.upload_file(sample_json)
-        assert page.grid_visible(), "Grid should appear after JSON upload"
-
-    def test_upload_unsupported_type(self, page):
-        page.load()
-        # Create a .txt file — unsupported
-        tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
-        tmp.write("hello world")
-        tmp.close()
-        try:
-            page.upload_file(tmp.name)
-            # Should show an error modal or status with "unsupported"
-            time.sleep(1)
-            status = page.get_status_text().lower()
-            modal_text = ""
-            try:
-                modal_text = page.d.find_element(By.ID, "error-modal").text.lower()
-            except Exception:
-                pass
-            assert any(k in status + modal_text for k in ("unsupported", "error", "type", ".txt")), \
-                "Expected an unsupported-file-type error"
-        finally:
-            os.unlink(tmp.name)
-
-
-class TestSidebarNavigation:
-    """Clicking sidebar tools opens the correct tool panel."""
-
-    @pytest.fixture(autouse=True)
-    def _load_with_data(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-
-    @pytest.mark.parametrize("tool_id,expected_text", [
-        ("tool-filter", "Filter"),
-        ("tool-sort",   "Sort"),
-        ("tool-stats",  "Stats"),
-        ("tool-rename", "Rename"),
-        ("tool-drop",   "Drop"),
-        ("tool-fillna", "Fill"),
-        ("tool-export", "Export"),
-    ])
-    def test_tool_opens(self, page, tool_id, expected_text):
-        page.open_tool(tool_id)
-        panel = page.find_id("tool-panel-content")
-        assert expected_text.lower() in panel.text.lower(), \
-            f"Panel text did not contain '{expected_text}': {panel.text!r}"
-
-    def test_tool_panel_has_apply_button(self, page):
-        """Filter panel should have a btn-filter button."""
-        page.open_tool("tool-filter")
-        btn = page.find_id("btn-filter")
-        assert btn is not None
-
-    def test_stats_panel_has_generate_button(self, page):
-        page.open_tool("tool-stats")
-        btn = page.find_id("btn-stats")
-        assert btn is not None
-
-    def test_export_panel_has_download_button(self, page):
-        page.open_tool("tool-export")
-        btn = page.find_id("btn-export")
-        assert btn is not None
-
-
-class TestFilterTool:
-    """Filter Rows tool — apply and verify feedback."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-filter")
-
-    def _select_mantine_select(self, page, select_id: str, option_text: str) -> None:
-        """Open a Mantine Select and click an option by visible text."""
-        # Click the input to open dropdown
-        wrapper = page.d.find_element(By.ID, select_id)
-        inp = wrapper.find_element(By.TAG_NAME, "input")
-        inp.click()
-        time.sleep(0.3)
-        # Find and click matching option in the portal
-        opts = page.d.find_elements(By.CSS_SELECTOR, "[data-combobox-option]")
-        for opt in opts:
-            if option_text.lower() in opt.text.lower():
-                opt.click()
-                return
-        raise AssertionError(f"Option '{option_text}' not found in {select_id}")
-
-    def test_filter_eq_numeric(self, page):
-        self._select_mantine_select(page, "filter-col", "value")
-        self._select_mantine_select(page, "filter-op",  "==")
-        val_inp = page.find_id("filter-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("3")
-        page.click_id("btn-filter")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("filter", "row", "applied")), \
-            f"Expected filter confirmation, got: {status!r}"
-
-    def test_filter_contains_text(self, page):
-        self._select_mantine_select(page, "filter-col", "name")
-        self._select_mantine_select(page, "filter-op",  "contains")
-        val_inp = page.find_id("filter-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("Item 1")
-        page.click_id("btn-filter")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("filter", "row", "applied")), \
-            f"Unexpected status: {status!r}"
-
-    def test_filter_without_value_does_not_crash(self, page):
-        """Clicking Apply Filter with no value selected should not crash the app."""
-        page.click_id("btn-filter")
-        time.sleep(0.8)
-        # App should still be responsive
-        assert page.find_id("app-root") is not None
-
-
-class TestSortTool:
-    """Sort Data tool."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-sort")
-
-    def _pick_column(self, page, col_name: str) -> None:
-        wrapper = page.d.find_element(By.ID, "sort-col")
-        inp = wrapper.find_element(By.TAG_NAME, "input")
-        inp.click()
-        time.sleep(0.3)
-        opts = page.d.find_elements(By.CSS_SELECTOR, "[data-combobox-option]")
-        for opt in opts:
-            if col_name.lower() in opt.text.lower():
-                opt.click()
-                return
-        raise AssertionError(f"Column '{col_name}' not found in sort-col dropdown")
-
-    def test_sort_ascending(self, page):
-        self._pick_column(page, "value")
-        page.click_id("btn-sort")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("sort", "asc", "applied")), \
-            f"Unexpected sort status: {status!r}"
-
-    def test_sort_descending(self, page):
-        self._pick_column(page, "score")
-        # Click the "Descending" segment
-        segs = page.d.find_elements(By.CSS_SELECTOR, "#sort-dir [data-active], #sort-dir label")
-        for seg in segs:
-            if "desc" in seg.text.lower():
-                seg.click()
-                break
-        page.click_id("btn-sort")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("sort", "desc", "applied")), \
-            f"Unexpected sort status: {status!r}"
-
-
-class TestStatsTool:
-    """Quick Stats tool."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-stats")
-
-    def test_stats_table_appears(self, page):
-        page.click_id("btn-stats")
-        time.sleep(1.5)
-        stats_box = page.find_id("stats-output")
-        assert stats_box.text.strip() != "", "Stats output should not be empty"
-
-    def test_stats_table_contains_descriptors(self, page):
-        page.click_id("btn-stats")
-        time.sleep(1.5)
-        stats_text = page.find_id("stats-output").text.lower()
-        for descriptor in ("mean", "std", "min", "max"):
-            assert descriptor in stats_text, f"Expected '{descriptor}' in stats table"
-
-    def test_stats_shows_id_for_numeric_columns(self, page):
-        page.click_id("btn-stats")
-        time.sleep(1.5)
-        table = page.d.find_element(By.ID, "stats-table")
-        headers = table.find_elements(By.TAG_NAME, "th")
-        header_texts = [h.text.lower() for h in headers]
-        assert any(col in header_texts for col in ("value", "score")), \
-            f"Expected numeric column headers, got: {header_texts}"
-
-
-class TestRenameTool:
-    """Rename Columns tool."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-rename")
-
-    def _pick_rename_col(self, page, col_name: str) -> None:
-        wrapper = page.d.find_element(By.ID, "rename-col")
-        inp = wrapper.find_element(By.TAG_NAME, "input")
-        inp.click()
-        time.sleep(0.3)
-        opts = page.d.find_elements(By.CSS_SELECTOR, "[data-combobox-option]")
-        for opt in opts:
-            if col_name.lower() in opt.text.lower():
-                opt.click()
-                return
-        raise AssertionError(f"Column '{col_name}' not found in rename-col dropdown")
-
-    def test_rename_column(self, page):
-        self._pick_rename_col(page, "name")
-        new_inp = page.find_id("rename-new").find_element(By.TAG_NAME, "input")
-        new_inp.clear()
-        new_inp.send_keys("label")
-        page.click_id("btn-rename")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert "rename" in status or "label" in status, \
-            f"Expected rename confirmation, got: {status!r}"
-
-    def test_rename_without_new_name_does_not_crash(self, page):
-        self._pick_rename_col(page, "score")
-        # Leave new name empty and click Rename
-        page.click_id("btn-rename")
-        time.sleep(0.8)
-        assert page.find_id("app-root") is not None
-
-
-class TestDropTool:
-    """Drop Columns tool."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-drop")
-
-    def _pick_drop_col(self, page, col_name: str) -> None:
-        wrapper = page.d.find_element(By.ID, "drop-cols")
-        inp = wrapper.find_element(By.TAG_NAME, "input")
-        inp.click()
-        time.sleep(0.3)
-        opts = page.d.find_elements(By.CSS_SELECTOR, "[data-combobox-option]")
-        for opt in opts:
-            if col_name.lower() in opt.text.lower():
-                opt.click()
-                return
-        raise AssertionError(f"Column '{col_name}' not in drop-cols dropdown")
-
-    def test_drop_single_column(self, page):
-        self._pick_drop_col(page, "flag")
-        page.click_id("btn-drop")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("drop", "column", "removed")), \
-            f"Expected drop confirmation, got: {status!r}"
-
-    def test_drop_multiple_columns(self, page):
-        # Re-upload to get fresh columns
-        page.load()
-        page.upload_file(
-            tempfile.NamedTemporaryFile(suffix=".csv", delete=False,
-                                        mode="w").name
-        )
-        page.load()
-        from conftest_helpers import _make_csv  # noqa: F401 (inline below)
-
-
-class TestFillNullsTool:
-    """Fill Null Values tool."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-fillna")
-
-    def test_fill_all_columns(self, page):
-        val_inp = page.find_id("fillna-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("N/A")
-        page.click_id("btn-fillna")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("fill", "null", "n/a", "0")), \
-            f"Expected fill confirmation, got: {status!r}"
-
-    def test_fill_numeric_value(self, page):
-        val_inp = page.find_id("fillna-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("0")
-        page.click_id("btn-fillna")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("fill", "null", "0")), \
-            f"Unexpected status: {status!r}"
-
-    def test_fill_without_value_does_not_crash(self, page):
-        # Empty fill value — should just raise PreventUpdate (no crash)
-        page.click_id("btn-fillna")
-        time.sleep(0.8)
-        assert page.find_id("app-root") is not None
-
-
-class TestExportTool:
-    """Export Data tool — format selection and download trigger."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-export")
-
-    @pytest.mark.parametrize("fmt_label", ["CSV", "JSON", "TSV"])
-    def test_export_format_selectable(self, page, fmt_label):
-        segs = page.d.find_elements(
-            By.CSS_SELECTOR, "#export-fmt label, #export-fmt [data-value]"
-        )
-        matched = [s for s in segs if fmt_label in s.text]
-        assert matched, f"Format segment '{fmt_label}' not found"
-        matched[0].click()
-        time.sleep(0.3)
-        # Button should still be enabled
-        btn = page.find_id("btn-export")
-        assert btn.is_enabled()
-
-    def test_export_button_triggers_download(self, page):
-        """Clicking Download should not crash — we can't intercept the file in
-        headless mode without extra Chrome prefs, so we just verify no error."""
-        page.click_id("btn-export")
-        time.sleep(1.5)
-        assert page.find_id("app-root") is not None
-
-
-class TestUndoFunctionality:
-    """Undo button — restores previous state."""
-
-    def test_undo_enabled_after_transform(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-fillna")
-        val_inp = page.find_id("fillna-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("0")
-        page.click_id("btn-fillna")
-        time.sleep(1)
-        # Undo button should now be enabled
-        btn = page.find_id("btn-undo")
-        disabled = btn.get_attribute("disabled") or btn.get_attribute("data-disabled")
-        assert disabled is None, "Undo button should be enabled after a transform"
-
-    def test_undo_restores_state(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        # Apply fill nulls
-        page.open_tool("tool-fillna")
-        val_inp = page.find_id("fillna-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("REPLACED")
-        page.click_id("btn-fillna")
-        time.sleep(1)
-        # Undo
-        page.click_id("btn-undo")
-        time.sleep(1)
-        status = page.get_status_text().lower()
-        assert any(k in status for k in ("undo", "revert", "previous")), \
-            f"Expected undo confirmation, got: {status!r}"
-
-    def test_undo_disabled_after_full_undo(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-        page.open_tool("tool-fillna")
-        val_inp = page.find_id("fillna-val").find_element(By.TAG_NAME, "input")
-        val_inp.clear()
-        val_inp.send_keys("0")
-        page.click_id("btn-fillna")
-        time.sleep(1)
-        page.click_id("btn-undo")
-        time.sleep(1)
-        # After undoing back to start there should be nothing left to undo
-        btn = page.find_id("btn-undo")
-        disabled = btn.get_attribute("disabled") or btn.get_attribute("data-disabled")
-        assert disabled is not None, "Undo button should be re-disabled when history empty"
-
-
-class TestMenuModals:
-    """Hamburger menu → modals open correctly."""
-
-    MODAL_MAP = {
-        "menu-about":     "about-modal",
-        "menu-shortcuts": "shortcuts-modal",
-        "menu-contact":   "contact-modal",
-        "menu-bug":       "bug-modal",
-        "menu-changelog": "changelog-modal",
+            chunks = split_timestamps(current_timestamps, num_chunks)
+            # Push chunks onto the stack (reverse so the first chunk is processed first)
+            pending_batches.extend(reversed(chunks))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Example usage
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    example_payload = {
+        "timestamps": [
+            "2024-01-01T00:00:00Z",
+            "2024-01-02T00:00:00Z",
+            "2024-01-03T00:00:00Z",
+            "2024-01-04T00:00:00Z",
+        ],
+        "filters": {"status": "active"},
     }
 
-    @pytest.fixture(autouse=True)
-    def _setup(self, page):
-        page.load()
-
-    def _open_hamburger(self, page) -> None:
-        """Open the hamburger / overflow menu button."""
-        try:
-            btn = page.find_clickable(By.ID, "hamburger-menu")
-            btn.click()
-        except Exception:
-            # Fallback: look for a button with tabler:menu icon aria
-            btn = page.find_clickable(
-                By.CSS_SELECTOR, "[aria-label*='menu'], [id*='hamburger'], [id*='menu-btn']"
-            )
-            btn.click()
-        time.sleep(0.4)
-
-    @pytest.mark.parametrize("menu_id,modal_id", list(MODAL_MAP.items()))
-    def test_menu_modal_opens(self, page, menu_id, modal_id):
-        self._open_hamburger(page)
-        try:
-            page.find_clickable(By.ID, menu_id).click()
-            time.sleep(0.6)
-            # Check that *some* modal overlay is present in DOM
-            overlays = page.d.find_elements(
-                By.CSS_SELECTOR, ".mantine-Modal-overlay, [data-mantine-modal-root]"
-            )
-            modal_el = page.d.find_element(By.ID, modal_id)
-            assert overlays or modal_el.is_displayed(), \
-                f"Modal '{modal_id}' did not open after clicking '{menu_id}'"
-        except Exception as exc:
-            pytest.skip(f"Hamburger menu item '{menu_id}' not accessible: {exc}")
-
-
-class TestResponsiveness:
-    """Layout sanity at different viewport widths."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, page, sample_csv):
-        page.load()
-        page.upload_file(sample_csv)
-
-    @pytest.mark.parametrize("width,height", [
-        (1440, 900),   # large desktop
-        (1024, 768),   # laptop
-        (768,  1024),  # tablet portrait
-    ])
-    def test_layout_at_viewport(self, driver, page, width, height):
-        driver.set_window_size(width, height)
-        time.sleep(0.5)
-        # App root must still be visible
-        root = driver.find_element(By.ID, "app-root")
-        assert root.is_displayed(), f"App root not visible at {width}x{height}"
-        # Restore default
-        driver.set_window_size(1400, 900)
-
-
-class TestNoDataGuards:
-    """Without uploading, tool operations should handle empty state gracefully."""
-
-    @pytest.fixture(autouse=True)
-    def _fresh_page(self, page):
-        page.load()
-
-    def test_stats_no_data(self, page):
-        page.open_tool("tool-stats")
-        page.click_id("btn-stats")
-        time.sleep(1)
-        # Should show an alert, not crash
-        stats_text = page.find_id("stats-output").text.lower()
-        assert any(k in stats_text for k in ("no data", "load", "upload", "no")), \
-            f"Expected 'no data' message, got: {stats_text!r}"
-
-    def test_export_no_data_does_not_crash(self, page):
-        page.open_tool("tool-export")
-        page.click_id("btn-export")
-        time.sleep(1)
-        assert page.find_id("app-root") is not None
-
-
-# ── Pytest config helpers ─────────────────────────────────────────────────────
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "headed: mark test to run only when browser is headed"
+    all_results = fetch_all_records(
+        count_url="https://api.example.com/records/count",
+        data_url="https://api.example.com/records",
+        payload=example_payload,
+        timestamp_key="timestamps",
     )
 
-
-def pytest_addoption(parser):
-    parser.addoption(
-        "--headed",
-        action="store_true",
-        default=False,
-        help="Run browser in headed (non-headless) mode",
-    )
-
-
-def pytest_sessionstart(session):
-    # Verify the app is reachable before running any tests
-    import urllib.request
-    import urllib.error
-    try:
-        urllib.request.urlopen(BASE_URL, timeout=5)
-    except (urllib.error.URLError, ConnectionRefusedError):
-        print(
-            f"\n⚠️  Could not reach {BASE_URL}.\n"
-            "   Start the app first:  python data_dashboard_v1_26.py\n",
-            file=sys.stderr,
-        )
+    print(f"Total batches returned: {len(all_results)}")
